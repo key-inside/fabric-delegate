@@ -33,12 +33,12 @@ type Client struct {
 	greylist     *greylist.Filter
 }
 
-func New(channelProvider context.ChannelProvider, opts ...channel.ClientOption) (*Client, error) {
-	cc, err := channel.New(channelProvider, opts...)
+// do not support channel.ClientOption
+func New(channelProvider context.ChannelProvider) (*Client, error) {
+	cc, err := channel.New(channelProvider)
 	if err != nil {
 		return nil, err
 	}
-
 	// no errors proved above
 	channelContext, _ := channelProvider()
 	membership, _ := channelContext.ChannelService().Membership()

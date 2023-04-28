@@ -1,7 +1,9 @@
 package fabsdk
 
 import (
+	contextApi "github.com/hyperledger/fabric-sdk-go/pkg/common/providers/context"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/core"
+	"github.com/hyperledger/fabric-sdk-go/pkg/context"
 	"github.com/hyperledger/fabric-sdk-go/pkg/fabsdk"
 
 	"github.com/key-inside/fabric-delegate/pkg/fabsdk/factory/dlgsvc"
@@ -19,4 +21,16 @@ func New(configProvider core.ConfigProvider, opts ...fabsdk.Option) (*FabricSDK,
 		return nil, err
 	}
 	return &FabricSDK{sdk}, nil
+}
+
+// override
+func (sdk *FabricSDK) ChannelContext(channelID string, options ...ContextOption) contextApi.ChannelProvider {
+	opts := []fabsdk.ContextOption{}
+	for _, opt := range options {
+		opts = append(opts, opt())
+	}
+	return func() (contextApi.Channel, error) {
+		clientCtxProvider := sdk.Context(opts...)
+		return context.NewChannel(clientCtxProvider, channelID)
+	}
 }

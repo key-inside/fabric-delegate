@@ -1,0 +1,21 @@
+# OSX
+.DS_Store
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+
+# Test
+*.test
+test/fixtures/*
+!test/fixtures/sample/
+
+# Go module
+vendor/
+
+# Artifacts of the Fabric SDK
+keystore/

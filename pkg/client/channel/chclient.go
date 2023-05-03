@@ -2,7 +2,9 @@ package channel
 
 import (
 	reqContext "context"
+	"crypto/sha256"
 	"fmt"
+	"hash"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -16,7 +18,10 @@ import (
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/errors/retry"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/errors/status"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/context"
+	contextApi "github.com/hyperledger/fabric-sdk-go/pkg/common/providers/context"
+	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/core"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/fab"
+	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/msp"
 	contextImpl "github.com/hyperledger/fabric-sdk-go/pkg/context"
 	"github.com/hyperledger/fabric-sdk-go/pkg/fab/txn"
 
@@ -99,6 +104,65 @@ func (cc *Client) CreateSignedProposal(request Request) (*pb.SignedProposal, err
 	}
 	// sign the proposal
 	signature, err := cc.Sign(proposalBytes)
+	if err != nil {
+		return nil, fmt.Errorf("sign proposal failed: %w", err)
+	}
+
+	return &pb.SignedProposal{
+		ProposalBytes: proposalBytes,
+		Signature:     signature,
+	}, nil
+}
+
+type dummyCtx struct {
+	contextApi.Client
+	si msp.SigningIdentity
+}
+
+func (c dummyCtx) Serialize() ([]byte, error) {
+	return c.si.Serialize()
+}
+
+func (dummyCtx) CryptoSuite() core.CryptoSuite {
+	return cryptoSuite{}
+}
+
+type cryptoSuite struct {
+	core.CryptoSuite
+}
+
+func (cryptoSuite) GetHash(opts core.HashOpts) (h hash.Hash, err error) {
+	return sha256.New(), nil
+}
+
+func CreateSignedProposal(si msp.SigningIdentity, channelID string, request Request) (*pb.SignedProposal, error) {
+	if request.ChaincodeID == "" || request.Fcn == "" {
+		return nil, fmt.Errorf("ChaincodeID and Fcn are required")
+	}
+
+	// tx header
+	txh, err := txn.NewHeader(dummyCtx{si: si}, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("creating transaction header failed: %w", err)
+	}
+
+	// proposal
+	proposal, err := txn.CreateChaincodeInvokeProposal(txh, fab.ChaincodeInvokeRequest{
+		ChaincodeID:  request.ChaincodeID,
+		Fcn:          request.Fcn,
+		Args:         request.Args,
+		TransientMap: request.TransientMap,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating transaction proposal failed: %w", err)
+	}
+
+	proposalBytes, err := proto.Marshal(proposal.Proposal)
+	if err != nil {
+		return nil, fmt.Errorf("marshal proposal failed: %w", err)
+	}
+
+	signature, err := si.Sign(proposalBytes)
 	if err != nil {
 		return nil, fmt.Errorf("sign proposal failed: %w", err)
 	}

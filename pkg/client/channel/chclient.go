@@ -18,7 +18,6 @@ import (
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/errors/retry"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/errors/status"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/context"
-	contextApi "github.com/hyperledger/fabric-sdk-go/pkg/common/providers/context"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/core"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/fab"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/msp"
@@ -77,30 +76,9 @@ func (cc *Client) Sign(data []byte) ([]byte, error) {
 //	Returns:
 //	the signed proposal
 func (cc *Client) CreateSignedProposal(request Request) (*pb.SignedProposal, error) {
-	if request.ChaincodeID == "" || request.Fcn == "" {
-		return nil, fmt.Errorf("ChaincodeID and Fcn are required")
-	}
-
-	// tx header
-	txh, err := txn.NewHeader(cc.context, cc.context.ChannelID())
+	proposalBytes, err := createProposal(cc.context, request)
 	if err != nil {
-		return nil, fmt.Errorf("creating transaction header failed: %w", err)
-	}
-
-	// proposal
-	proposal, err := txn.CreateChaincodeInvokeProposal(txh, fab.ChaincodeInvokeRequest{
-		ChaincodeID:  request.ChaincodeID,
-		Fcn:          request.Fcn,
-		Args:         request.Args,
-		TransientMap: request.TransientMap,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating transaction proposal failed: %w", err)
-	}
-
-	proposalBytes, err := proto.Marshal(proposal.Proposal)
-	if err != nil {
-		return nil, fmt.Errorf("marshal proposal failed: %w", err)
+		return nil, err
 	}
 	// sign the proposal
 	signature, err := cc.Sign(proposalBytes)
@@ -114,34 +92,11 @@ func (cc *Client) CreateSignedProposal(request Request) (*pb.SignedProposal, err
 	}, nil
 }
 
-type dummyCtx struct {
-	contextApi.Client
-	si msp.SigningIdentity
-}
-
-func (c dummyCtx) Serialize() ([]byte, error) {
-	return c.si.Serialize()
-}
-
-func (dummyCtx) CryptoSuite() core.CryptoSuite {
-	return cryptoSuite{}
-}
-
-type cryptoSuite struct {
-	core.CryptoSuite
-}
-
-func (cryptoSuite) GetHash(opts core.HashOpts) (h hash.Hash, err error) {
-	return sha256.New(), nil
-}
-
-func CreateSignedProposal(si msp.SigningIdentity, channelID string, request Request) (*pb.SignedProposal, error) {
+func createProposal(context context.Channel, request Request) ([]byte, error) {
 	if request.ChaincodeID == "" || request.Fcn == "" {
 		return nil, fmt.Errorf("ChaincodeID and Fcn are required")
 	}
-
-	// tx header
-	txh, err := txn.NewHeader(dummyCtx{si: si}, channelID)
+	txh, err := txn.NewHeader(context, context.ChannelID())
 	if err != nil {
 		return nil, fmt.Errorf("creating transaction header failed: %w", err)
 	}
@@ -161,6 +116,15 @@ func CreateSignedProposal(si msp.SigningIdentity, channelID string, request Requ
 	if err != nil {
 		return nil, fmt.Errorf("marshal proposal failed: %w", err)
 	}
+	return proposalBytes, nil
+}
+
+// CreateSignedProposal currently only supports sha256 hashing algorithm
+func CreateSignedProposal(si msp.SigningIdentity, channelID string, request Request) (*pb.SignedProposal, error) {
+	proposalBytes, err := createProposal(dummyCtx{si: si, channelID: channelID}, request)
+	if err != nil {
+		return nil, err
+	}
 
 	signature, err := si.Sign(proposalBytes)
 	if err != nil {
@@ -171,6 +135,32 @@ func CreateSignedProposal(si msp.SigningIdentity, channelID string, request Requ
 		ProposalBytes: proposalBytes,
 		Signature:     signature,
 	}, nil
+}
+
+type dummyCtx struct {
+	context.Channel
+	si        msp.SigningIdentity
+	channelID string
+}
+
+func (c dummyCtx) Serialize() ([]byte, error) {
+	return c.si.Serialize()
+}
+
+func (dummyCtx) CryptoSuite() core.CryptoSuite {
+	return cryptoSuite{}
+}
+
+func (c dummyCtx) ChannelID() string {
+	return c.channelID
+}
+
+type cryptoSuite struct {
+	core.CryptoSuite
+}
+
+func (cryptoSuite) GetHash(opts core.HashOpts) (h hash.Hash, err error) {
+	return sha256.New(), nil
 }
 
 // DelegateQuery send a signed proposal

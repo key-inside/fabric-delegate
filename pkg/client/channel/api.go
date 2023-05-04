@@ -15,6 +15,8 @@ import (
 
 type Request channel.Request
 
+type Response channel.Response
+
 type DelegateRequestOption func(ctx context.Client, opts *invoke.Opts) error
 
 // WithTargets allows overriding of the target peers for the request

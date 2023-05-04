@@ -2,7 +2,9 @@ package channel
 
 import (
 	reqContext "context"
+	"crypto/sha256"
 	"fmt"
+	"hash"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -16,7 +18,10 @@ import (
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/errors/retry"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/errors/status"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/context"
+	contextApi "github.com/hyperledger/fabric-sdk-go/pkg/common/providers/context"
+	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/core"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/fab"
+	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/msp"
 	contextImpl "github.com/hyperledger/fabric-sdk-go/pkg/context"
 	"github.com/hyperledger/fabric-sdk-go/pkg/fab/txn"
 
@@ -109,6 +114,65 @@ func (cc *Client) CreateSignedProposal(request Request) (*pb.SignedProposal, err
 	}, nil
 }
 
+type dummyCtx struct {
+	contextApi.Client
+	si msp.SigningIdentity
+}
+
+func (c dummyCtx) Serialize() ([]byte, error) {
+	return c.si.Serialize()
+}
+
+func (dummyCtx) CryptoSuite() core.CryptoSuite {
+	return cryptoSuite{}
+}
+
+type cryptoSuite struct {
+	core.CryptoSuite
+}
+
+func (cryptoSuite) GetHash(opts core.HashOpts) (h hash.Hash, err error) {
+	return sha256.New(), nil
+}
+
+func CreateSignedProposal(si msp.SigningIdentity, channelID string, request Request) (*pb.SignedProposal, error) {
+	if request.ChaincodeID == "" || request.Fcn == "" {
+		return nil, fmt.Errorf("ChaincodeID and Fcn are required")
+	}
+
+	// tx header
+	txh, err := txn.NewHeader(dummyCtx{si: si}, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("creating transaction header failed: %w", err)
+	}
+
+	// proposal
+	proposal, err := txn.CreateChaincodeInvokeProposal(txh, fab.ChaincodeInvokeRequest{
+		ChaincodeID:  request.ChaincodeID,
+		Fcn:          request.Fcn,
+		Args:         request.Args,
+		TransientMap: request.TransientMap,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating transaction proposal failed: %w", err)
+	}
+
+	proposalBytes, err := proto.Marshal(proposal.Proposal)
+	if err != nil {
+		return nil, fmt.Errorf("marshal proposal failed: %w", err)
+	}
+
+	signature, err := si.Sign(proposalBytes)
+	if err != nil {
+		return nil, fmt.Errorf("sign proposal failed: %w", err)
+	}
+
+	return &pb.SignedProposal{
+		ProposalBytes: proposalBytes,
+		Signature:     signature,
+	}, nil
+}
+
 // DelegateQuery send a signed proposal
 //
 //	Parameters:
@@ -117,18 +181,18 @@ func (cc *Client) CreateSignedProposal(request Request) (*pb.SignedProposal, err
 //
 //	Returns:
 //	the proposal responses from peer(s)
-func (cc *Client) DelegateQuery(signedProposal *pb.SignedProposal, options ...DelegateRequestOption) (channel.Response, error) {
+func (cc *Client) DelegateQuery(signedProposal *pb.SignedProposal, options ...DelegateRequestOption) (Response, error) {
 	proposal, err := getProposalFromProposalBytes(signedProposal.ProposalBytes)
 	if err != nil {
-		return channel.Response{}, err
+		return Response{}, err
 	}
 	chh, err := getChannelHeaderFromHeaderBytes(proposal.Header)
 	if err != nil {
-		return channel.Response{}, err
+		return Response{}, err
 	}
 	cid, err := getChaincodeIDFromExtension(chh.Extension)
 	if err != nil {
-		return channel.Response{}, err
+		return Response{}, err
 	}
 
 	request := channel.Request{
@@ -140,7 +204,11 @@ func (cc *Client) DelegateQuery(signedProposal *pb.SignedProposal, options ...De
 
 	options = append(options, addDefaultTimeout(fab.Query))
 	options = append(options, addDefaultTargetFilter(cc.context, filter.ChaincodeQuery))
-	return cc.DelegateInvokeHandler(handler, request, options...)
+	res, err := cc.DelegateInvokeHandler(handler, request, options...)
+	if err != nil {
+		return Response{}, err
+	}
+	return Response(res), nil
 }
 
 // DelegateEndorseAndCreateTxnPayload selects the peers along the invocation chain and sends the proposal. The txnPayload is then created
@@ -152,18 +220,18 @@ func (cc *Client) DelegateQuery(signedProposal *pb.SignedProposal, options ...De
 //
 //	Returns:
 //	the proposal responses from peer(s) with the payload
-func (cc *Client) DelegateEndorseAndCreateTxnPayload(signedProposal *pb.SignedProposal, options ...DelegateRequestOption) (*common.Payload, channel.Response, error) {
+func (cc *Client) DelegateEndorseAndCreateTxnPayload(signedProposal *pb.SignedProposal, options ...DelegateRequestOption) (*common.Payload, Response, error) {
 	proposal, err := getProposalFromProposalBytes(signedProposal.ProposalBytes)
 	if err != nil {
-		return nil, channel.Response{}, err
+		return nil, Response{}, err
 	}
 	chh, err := getChannelHeaderFromHeaderBytes(proposal.Header)
 	if err != nil {
-		return nil, channel.Response{}, err
+		return nil, Response{}, err
 	}
 	cid, err := getChaincodeIDFromExtension(chh.Extension)
 	if err != nil {
-		return nil, channel.Response{}, err
+		return nil, Response{}, err
 	}
 
 	request := channel.Request{
@@ -177,15 +245,15 @@ func (cc *Client) DelegateEndorseAndCreateTxnPayload(signedProposal *pb.SignedPr
 	options = append(options, addDefaultTargetFilter(cc.context, filter.EndorsingPeer))
 	res, err := cc.DelegateInvokeHandler(handler, request, options...)
 	if err != nil {
-		return nil, res, fmt.Errorf("failed to invoke handlers: %w", err)
+		return nil, Response(res), fmt.Errorf("failed to invoke handlers: %w", err)
 	}
 
 	txnPayload, err := createTxnPayload(chh.TxId, proposal, res.Responses)
 	if err != nil {
-		return nil, res, fmt.Errorf("failed to create txn payload with endorsement results: %w", err)
+		return nil, Response(res), fmt.Errorf("failed to create txn payload with endorsement results: %w", err)
 	}
 
-	return txnPayload, res, nil
+	return txnPayload, Response(res), nil
 }
 
 // DelegateInvokeHandler invokes handler using request and optional request options provided
@@ -197,11 +265,11 @@ func (cc *Client) DelegateEndorseAndCreateTxnPayload(signedProposal *pb.SignedPr
 //
 //	Returns:
 //	the proposal responses from peer(s)
-func (cc *Client) DelegateInvokeHandler(handler invoke.Handler, request channel.Request, options ...DelegateRequestOption) (channel.Response, error) {
+func (cc *Client) DelegateInvokeHandler(handler invoke.Handler, request channel.Request, options ...DelegateRequestOption) (Response, error) {
 	//Read execute tx options
 	txnOpts, err := cc.prepareOptsFromOptions(cc.context, options...)
 	if err != nil {
-		return channel.Response{}, err
+		return Response{}, err
 	}
 
 	reqCtx, cancel := cc.createReqContext(&txnOpts)
@@ -210,7 +278,7 @@ func (cc *Client) DelegateInvokeHandler(handler invoke.Handler, request channel.
 	//Prepare context objects for handler
 	requestContext, clientContext, err := cc.prepareHandlerContexts(reqCtx, request, txnOpts)
 	if err != nil {
-		return channel.Response{}, err
+		return Response{}, err
 	}
 
 	invoker := retry.NewInvoker(
@@ -242,9 +310,9 @@ func (cc *Client) DelegateInvokeHandler(handler invoke.Handler, request channel.
 	}()
 	select {
 	case <-complete:
-		return channel.Response(requestContext.Response), requestContext.Error
+		return Response(requestContext.Response), requestContext.Error
 	case <-reqCtx.Done():
-		return channel.Response{}, status.New(status.ClientStatus, status.Timeout.ToInt32(),
+		return Response{}, status.New(status.ClientStatus, status.Timeout.ToInt32(),
 			"request timed out or been cancelled", nil)
 	}
 }
@@ -363,10 +431,10 @@ func getTxnIDFromPayloadBytes(payloadBytes []byte) (string, error) {
 //
 //	 Returns:
 //	 the transaction result
-func (cc *Client) BroadcastEnvelope(envelope *common.Envelope, options ...DelegateRequestOption) (channel.Response, error) {
+func (cc *Client) BroadcastEnvelope(envelope *common.Envelope, options ...DelegateRequestOption) (Response, error) {
 	txnID, err := getTxnIDFromPayloadBytes(envelope.Payload)
 	if err != nil {
-		return channel.Response{}, fmt.Errorf("failed to get txnID from envelope: %w", err)
+		return Response{}, fmt.Errorf("failed to get txnID from envelope: %w", err)
 	}
 
 	options = append(options, addDefaultTimeout(fab.Execute))
@@ -375,7 +443,7 @@ func (cc *Client) BroadcastEnvelope(envelope *common.Envelope, options ...Delega
 	// reads execute tx options
 	txnOpts, err := cc.prepareOptsFromOptions(cc.context, options...)
 	if err != nil {
-		return channel.Response{}, err
+		return Response{}, err
 	}
 
 	// prepares request context
@@ -385,17 +453,17 @@ func (cc *Client) BroadcastEnvelope(envelope *common.Envelope, options ...Delega
 	// prepares delegate transactor
 	t, err := cc.context.ChannelService().Transactor(reqCtx)
 	if err != nil {
-		return channel.Response{}, fmt.Errorf("preparation of channel config failed: %w", err)
+		return Response{}, fmt.Errorf("preparation of channel config failed: %w", err)
 	}
 	delegator, ok := t.(*delegate.Transactor)
 	if !ok {
-		return channel.Response{}, fmt.Errorf("not delegate transactor")
+		return Response{}, fmt.Errorf("not delegate transactor")
 	}
 
 	// registers tx event
 	reg, statusNotifier, err := cc.eventService.RegisterTxStatusEvent(string(txnID))
 	if err != nil {
-		return channel.Response{}, fmt.Errorf("failed to register tx event: %w", err)
+		return Response{}, fmt.Errorf("failed to register tx event: %w", err)
 	}
 	defer cc.eventService.Unregister(reg)
 
@@ -405,7 +473,7 @@ func (cc *Client) BroadcastEnvelope(envelope *common.Envelope, options ...Delega
 		Signature: envelope.Signature,
 	})
 	if err != nil {
-		return channel.Response{}, fmt.Errorf("failed to broadcast signed envelope: %w", err)
+		return Response{}, fmt.Errorf("failed to broadcast signed envelope: %w", err)
 	}
 
 	var res = channel.Response{}
@@ -414,15 +482,15 @@ func (cc *Client) BroadcastEnvelope(envelope *common.Envelope, options ...Delega
 		res.TxValidationCode = txStatus.TxValidationCode
 
 		if txStatus.TxValidationCode != pb.TxValidationCode_VALID {
-			return res, status.New(status.EventServerStatus, int32(txStatus.TxValidationCode),
+			return Response(res), status.New(status.EventServerStatus, int32(txStatus.TxValidationCode),
 				"received invalid transaction", nil)
 		}
 	case <-reqCtx.Done():
-		return res, status.New(status.ClientStatus, status.Timeout.ToInt32(),
+		return Response(res), status.New(status.ClientStatus, status.Timeout.ToInt32(),
 			"Execute didn't receive block event", nil)
 	}
 
-	return res, nil
+	return Response(res), nil
 }
 
 func addDefaultTimeout(tt fab.TimeoutType) DelegateRequestOption {
